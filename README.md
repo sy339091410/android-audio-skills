@@ -40,6 +40,18 @@
 - 车载特有：多音区管理、CarAudioService 协同、安全告警最高优先级
 - 调试速查：dumpsys / logcat 一键诊断焦点冲突
 
+### 🧭 [android-car-audio-policy](./android-car-audio-policy/SKILL.md)
+
+**Android 15 车载 AudioPolicyService 策略管理** —— 音频路由的"决策大脑"
+
+- 策略与执行分离架构：APS（决策） ↔ AudioFlinger（执行）
+- 三层配置体系：拓扑 XML + 策略规则 XML + 车载独立配置
+- 完整路由决策链：AudioAttributes → Strategy → DevicePriority → FinalDevice
+- 设备管理：连接/断开通知、Failover 机制、蓝牙 A2DP 特殊处理
+- ForceUse 强制路由 + 四种音频模式切换
+- Android 15 新特性：AIDL HAL 迁移、音量组路由绑定、CAP Engine 可配置引擎
+- 车载特有：多音区策略路由、CarAudioService 协同、car_audio_configuration.xml
+
 ---
 
 ## ✨ 为什么值得关注
@@ -58,7 +70,7 @@
 本仓库会持续完善，计划覆盖的方向包括：
 
 - [ ] AudioTrack 播放流程详解
-- [ ] AudioPolicyService 路由策略分析
+- [x] AudioPolicyService 路由策略分析
 - [ ] AAudio MMAP 低延迟路径
 - [ ] 蓝牙音频（A2DP / LE Audio）调用链
 - [x] 音频焦点（AudioFocus）管理机制
@@ -80,7 +92,9 @@ your-project/
         │   └── SKILL.md
         ├── android-audioflinger-architecture/
         │   └── SKILL.md
-        └── android-car-audio-focus/
+        ├── android-car-audio-focus/
+        │   └── SKILL.md
+        └── android-car-audio-policy/
             └── SKILL.md
 ```
 
