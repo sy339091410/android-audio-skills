@@ -107,11 +107,31 @@ AI 助手会在分析音频相关问题时自动调用对应技能。
 基于 **Android 15（API Level 35）** AOSP 源码分析，关键路径：
 
 ```
-frameworks/av/services/audioflinger/     # AudioFlinger 服务
-frameworks/av/media/libaudioclient/      # 客户端 Native 库
-frameworks/av/services/audiopolicy/      # 音频策略服务
-hardware/interfaces/audio/               # HAL 接口定义
+# === AudioFlinger 架构（Native 执行层）===
+frameworks/av/services/audioflinger/     # AudioFlinger 服务（混音、线程、Track）
+frameworks/av/media/libaudioclient/      # 客户端 Native 库（AudioTrack/AudioRecord）
+frameworks/av/media/audioserver/         # audioserver 启动入口
+
+# === AudioPolicyService 策略管理（Native 决策层）===
+frameworks/av/services/audiopolicy/      # 音频策略服务（APM、Engine、路由）
+frameworks/av/services/audiopolicy/enginedefault/src/  # 默认 Engine 实现
+
+# === 音频焦点 & 系统服务（Java 层）===
+frameworks/base/services/core/java/com/android/server/audio/  # AudioService、MediaFocusControl
+frameworks/base/media/java/android/media/                     # AudioManager 客户端 API
+
+# === 车载音频服务 ===
+packages/services/Car/service/src/com/android/car/audio/      # CarAudioService（多音区、车载焦点）
+packages/services/Car/service/src/com/android/car/power/      # CarPowerManagementService（电源状态）
+
+# === HAL 接口与实现 ===
+hardware/interfaces/audio/               # Audio HAL 接口定义（AIDL）
 hardware/qcom/audio/hal/                 # QCOM HAL 实现
+
+# === 策略配置文件 ===
+/vendor/etc/audio_policy_configuration.xml        # 音频拓扑配置（mixPort/devicePort/route）
+/system/etc/audio_policy_engine_configuration.xml # 引擎策略规则（ProductStrategy）
+/vendor/etc/car_audio_configuration.xml           # 车载音频配置（音区/音量组/CAP Engine）
 ```
 
 ---
