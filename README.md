@@ -29,6 +29,17 @@
 - QCOM HAL 加载机制：`dlopen` → `adev_open` → `open_input_stream`
 - 电源状态影响：WAIT_FOR_VHAL 如何导致录音初始化失败
 
+### 🚗 [android-car-audio-focus](./android-car-audio-focus/SKILL.md)
+
+**Android 15 车载音频焦点管理** —— 多音源协调的"交通指挥系统"
+
+- 四种焦点类型 + 四种通知类型，车载场景最佳响应策略
+- MediaFocusControl 仲裁机制：FocusStack LIFO 栈管理
+- 延迟焦点机制：通话中媒体请求挂起，通话结束自动恢复
+- Android 15 新特性：系统级自动 Duck（-12dBFS）、targetSdk 35+ 后台限制
+- 车载特有：多音区管理、CarAudioService 协同、安全告警最高优先级
+- 调试速查：dumpsys / logcat 一键诊断焦点冲突
+
 ---
 
 ## ✨ 为什么值得关注
@@ -50,7 +61,7 @@
 - [ ] AudioPolicyService 路由策略分析
 - [ ] AAudio MMAP 低延迟路径
 - [ ] 蓝牙音频（A2DP / LE Audio）调用链
-- [ ] 音频焦点（AudioFocus）管理机制
+- [x] 音频焦点（AudioFocus）管理机制
 - [ ] 车载音频场景（CarAudioService）专题
 
 > 💡 欢迎提 Issue 建议你关心的音频话题，或直接 PR 贡献！
@@ -67,7 +78,9 @@ your-project/
     └── skills/
         ├── android-audio-call-chain/
         │   └── SKILL.md
-        └── android-audioflinger-architecture/
+        ├── android-audioflinger-architecture/
+        │   └── SKILL.md
+        └── android-car-audio-focus/
             └── SKILL.md
 ```
 
