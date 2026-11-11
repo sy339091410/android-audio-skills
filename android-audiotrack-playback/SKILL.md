@@ -53,19 +53,35 @@ new AudioTrack.Builder()
     .build();
 ```
 
-Builder 不显式设置的默认值（很容易踩坑）：
+Builder 不显式设置的默认值（`AudioTrack.Builder.build()` 实测行为，很容易踩坑）：
 
-| 属性 | 缺省值 |
-|-----|--------|
-| AudioAttributes | `USAGE_MEDIA` |
-| AudioFormat | 立体声 / `PCM_16BIT` / 采样率由设备决定 |
-| bufferSizeInBytes | 流模式下自动取最小值 |
-| transferMode | `MODE_STREAM` |
-| sessionId | 自动生成新 ID |
+| 属性 | 缺省值 | 在哪生效 |
+|-----|--------|---------|
+| AudioAttributes | `USAGE_MEDIA` | `build()` 里补 |
+| AudioFormat | `CHANNEL_OUT_STEREO` + `ENCODING_DEFAULT`（即 16bit PCM），采样率 `SAMPLE_RATE_UNSPECIFIED` 由设备决定 | `build()` 里补 |
+| bufferSizeInBytes | **先填「1 帧的字节数」**，再由 native 换算成最小缓冲 | `build()` 里补 |
+| transferMode | `MODE_STREAM` | 字段声明时初始化 |
+| sessionId | `AUDIO_SESSION_ID_GENERATE` | 字段声明时初始化 |
+| performanceMode | `PERFORMANCE_MODE_NONE` | 字段声明时初始化 |
+
+> 注意 buffer 那一行：源码注释写的是 "use a single frame for the buffer size and let the native code figure out the minimum buffer size"。它不是「自动取 `getMinBufferSize()`」，而是先塞 1 帧，让 `PlaybackThread::createTrack_l()` 用 `calculateMinFrameCount()` 算最小值。所以不设 buffer 时，你拿到的大小由系统决定，不是你能预期的值。
 
 **旧构造器（已废弃但仍兼容）会做一次隐式翻译**：`AudioTrack(int streamType, ...)` → `setLegacyStreamType(streamType)` → `usageForStreamType()` 的 switch 映射（`STREAM_MUSIC → USAGE_MEDIA`、`STREAM_VOICE_CALL → USAGE_VOICE_COMMUNICATION`、`STREAM_ALARM → USAGE_ALARM`…）。
 
-⚠️ **Android 15 的一个行为变化**：从 streamType 推导 AudioAttributes 时，**不再从策略里读 contentType**，且 `STREAM_MUSIC` 的 contentType 保持 `CONTENT_TYPE_UNKNOWN`（commit `2eb20eb`，理由：streamType 不足以表达 contentType）。以前写死 `CONTENT_TYPE_MUSIC` 的代码，在 dumpsys 里会看到 `content=CONTENT_TYPE_UNKNOWN`，**这不是 bug**。
+⚠️ **Android 15 的一个行为变化**：从 streamType 推导 AudioAttributes 时，**不再从策略里读 contentType**，且 `STREAM_MUSIC` 的 contentType 保持 `CONTENT_TYPE_UNKNOWN`。源码里这两处注释很直白：
+
+```java
+// on purpose ignoring the content type: stream types are deprecated for
+// playback, making assumptions about the content type is prone to
+// interpretation errors for ambiguous types such as STREAM_TTS and STREAM_MUSIC
+//mContentType = attributes.mContentType;
+
+case AudioSystem.STREAM_MUSIC:
+    // leaving as CONTENT_TYPE_UNKNOWN
+    break;
+```
+
+所以以前写死 `CONTENT_TYPE_MUSIC` 的代码，在 dumpsys 里会看到 `content=CONTENT_TYPE_UNKNOWN`，**这不是 bug**。其余分支（`STREAM_VOICE_CALL → SPEECH`、`STREAM_RING/ALARM/NOTIFICATION → SONIFICATION`、`STREAM_TTS` 额外加 `FLAG_BEACON`）仍按老规则填。
 
 ### 2.2 JNI 层：参数过河
 
@@ -74,7 +90,11 @@ Builder 不显式设置的默认值（很容易踩坑）：
 - `AudioAttributes` → `audio_attributes_t*`（身份：usage / contentType / flags / tags）
 - `int[]` → 逐项拆成 sampleRate / channelMask / format / sessionId
 - `Parcel` → `AttributionSourceState`（调用者身份，用于权限与归因）
-- 按 `MODE_STREAM` / `MODE_STATIC` 二选一：`MODE_STREAM` 传 `0`（共享内存为 null，交给服务端分配）且 transferType 用 `TRANSFER_SYNC`；`MODE_STATIC` 走 `allocSharedMem()` 自己分配
+- 按 `MODE_STREAM` / `MODE_STATIC` 二选一（源码实测）：
+  - `MODE_STREAM`：`sharedBuffer = 0`（交给服务端分配）、`transferType = TRANSFER_SYNC`（offload 时是 `TRANSFER_SYNC_NOTIF_CALLBACK`）、`threadCanCallJava = true`
+  - `MODE_STATIC`：先 `allocSharedMem(buffSizeInBytes)` 自己分配、`transferType = TRANSFER_SHARED`
+
+> `threadCanCallJava = true` 这个参数不是随手写的——它是后面 `TRANSFER_SYNC` 能否申请 FAST 通道的必要条件（见 2.3 第 ② 关）。Native 侧自己建 AudioTrack 时如果传 false，FAST 会被静默清掉。
 
 ### 2.3 Native 层：`AudioTrack::set()` 里的那处硬改写
 
@@ -88,7 +108,25 @@ if ((flags & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD) || !audio_is_linear_pcm(format)
 
 **这一句是「为什么我的 Track 没走 Fast 通道」的第一现场**：只要格式不是线性 PCM，或者带 offload 标志，系统会强制加上 `DIRECT` 并且**清掉 `FAST`**。你在 App 里请求低延迟，底层直接被降级，而且不会报错。
 
-紧接着 `createTrack_l()` 会再补一刀：只有 `fastAllowed`（当前是前台 / 有可感知的音频活动）才保留 `FAST` 标志，否则同样被清掉。
+**FAST 一共要过三道关**，全部通过才真正跑在 FastTrack 上。任何一道不过，标志被静默清掉：
+
+| 关卡 | 位置 | 条件 |
+|:---:|------|------|
+| ① 格式 | `AudioTrack::set()` | 必须是线性 PCM 且没请求 offload，否则强制 `DIRECT` 并清 `FAST` |
+| ② 客户端 | `AudioTrack::createTrack_l()` | `fastAllowed = sharedBuffer \|\| transferAllowed`；`transferAllowed` = 回调模式 / obtain 模式 / 同步写且 `mThreadCanCallJava`。不满足打 `AUDIO_OUTPUT_FLAG_FAST denied by client` |
+| ③ 服务端 | `PlaybackThread::createTrack_l()` | 五个条件全要满足：线性 PCM、声道无需昂贵下混、`sampleRate == mSampleRate`（**App 采样率必须等于设备原生采样率**）、`hasFastMixer()`、`mFastTrackAvailMask != 0`（还有空槽位）。不满足打 `AUDIO_OUTPUT_FLAG_FAST denied: ...` |
+
+```cpp
+// 第 ③ 关的拒绝日志格式（字段齐了就知道卡在哪），按 format string 还原：
+// AUDIO_OUTPUT_FLAG_FAST denied: sharedBuffer=0x0 frameCount=960 mFrameCount=192
+//   format=0x1 mFormat=0x1 isLinear=1 channelMask=0x3 sampleRate=44100 mSampleRate=48000
+//   hasFastMixer=1 tid=1234 fastTrackAvailMask=0x0
+//   ↑ 采样率不匹配 + 槽位用尽，两个原因同时命中
+```
+
+另外 `sharedBuffer != 0`（即 `MODE_STATIC`）会让第 ② 关直接通过——静态 Track 天生满足条件。
+
+还有一处容易忽略：**效果链也会撤销 FAST**。`createTrack_l()` 里会遍历 `AUDIO_SESSION_DEVICE / OUTPUT_STAGE / OUTPUT_MIX / 本 session` 的 EffectChain 调 `checkOutputFlagCompatibility()`，挂了下混或重采样类效果，标志就没了。
 
 然后构造 AIDL 请求并跨进程：
 
@@ -102,28 +140,33 @@ CreateTrackRequest {
 }
 ```
 
-### 2.4 AudioFlinger 侧：`createTrack()` 的 12 步
+### 2.4 AudioFlinger 侧：`createTrack()` 的 15 步
 
 `frameworks/av/services/audioflinger/AudioFlinger.cpp`，`AudioFlinger::createTrack()`：
 
 ```
- 1. 解包 CreateTrackRequest（AIDL → 内部结构）
- 2. AudioSystem::getOutputForAttr()
-      → 路由决策，拿到 output.outputId / selectedDeviceId / portId
+ 1. 解包 CreateTrackRequest（AIDL → CreateTrackInput）
+ 2. 归属校验 checkAttributionSourcePackage / validateAttributionFromContextOrTrustedCaller
+ 3. sessionId == AUDIO_SESSION_ALLOCATE 时 newAudioUniqueId() 分配
+ 4. AudioSystem::getOutputForAttr()
+      → 路由决策，拿到 output.outputId / selectedDeviceId / portId / secondaryOutputs
       → 同时返回 isSpatialized / isBitPerfect（Android 15 已进入主流程）
- 3. 多音区场景：算出 secondaryOutputs
- 4. 分配 portId（AUDIO_PORT_HANDLE_NONE 时）
- 5. checkPlaybackThread_l(output.outputId) → 拿到已存在的播放线程
- 6. registerPid(callingPid) → Client（按进程复用，wp 弱引用防环）
- 7. 检查同 sessionId 的效果链是否在别的线程上（要在后面搬过来）
- 8. thread->createTrack_l(...)  ★ 真正创建 Track
- 9. 回填线程参数：afFrameCount / afSampleRate / afChannelMask / afFormat / afLatencyMs
-10. updateSecondaryOutputsForTrack_l()  → 连接辅助输出
-11. moveEffectChain_ll()                → 把效果链搬到本线程
-12. output.audioTrack = IAfTrack::createIAudioTrackAdapter(track)  → 返回给客户端
+ 5. 校验 streamType / channelMask / format
+ 6. 加 AF 主锁，checkPlaybackThread_l(output.outputId) → 拿到已存在的播放线程
+ 7. registerClient(pid, uid) → Client（按进程复用，wp 弱引用防环）
+ 8. 扫 mPlaybackThreads 找同 sessionId 的 EFFECT_SESSION，命中记下 effectThread
+ 9. 没找到则 getOrphanEffectChain_l(sessionId) → 孤儿效果链
+10. thread->createTrack_l(...)  ★ 真正创建 Track
+11. 回填线程参数：afFrameCount / afSampleRate / afChannelMask / afFormat / afLatencyMs
+12. 加线程锁，updateSecondaryOutputsForTrack_l() → 连接辅助输出（多音区/并发投递）
+13. moveEffectChain_ll() → 把效果链搬到本线程（有条件，最多调两次）
+14. 处理 mPendingSyncEvents；带 AUDIO_OUTPUT_FLAG_HW_AV_SYNC 时 setAudioHwSyncForSession_l
+15. output.audioTrack = IAfTrack::createIAudioTrackAdapter(track) → 返回给客户端
 ```
 
-**第 5 步是关键认知**：AudioFlinger 并不会为每个 Track 新开线程。线程是 `openOutput_l()` 时就按 output 建好的（`MixerThread` / `DirectOutputThread` / `OffloadThread` / `MmapPlaybackThread`），createTrack 只是把 Track 挂到一个**已经在跑的线程**上。
+**失败路径容易被忽略**：以上任何一步 `goto Exit`，最终都会执行 `AudioSystem::releaseOutput(portId)` 把端口还回去。如果日志里看到 createTrack 失败后 port 没释放、或者焦点状态卡住，先确认是不是走岔了清理逻辑。
+
+**第 6 步是关键认知**：AudioFlinger 并不会为每个 Track 新开线程。线程是 `openOutput_l()` 时就按 output 建好的（`MixerThread` / `DirectOutputThread` / `OffloadThread` / `MmapPlaybackThread`），createTrack 只是把 Track 挂到一个**已经在跑的线程**上。
 
 `outputId → 线程` 的对应关系（某 Tensor 机型 dump 实例，**ID 每台机器不同，仅供理解规律**）：
 
@@ -141,7 +184,7 @@ CreateTrackRequest {
 
 ### 2.5 `TrackBase` 构造：共享内存真正落地的地方
 
-前面 12 步都只是把 `sharedBuffer` 这个参数往下传。**真正分配共享内存的是 `TrackBase` 构造函数**（`frameworks/av/services/audioflinger/Tracks.cpp`，约 84 行起）。
+前面这些步骤都只是把 `sharedBuffer` 这个参数往下传。**真正分配共享内存的是 `TrackBase` 构造函数**（`frameworks/av/services/audioflinger/Tracks.cpp`，约 84 行起）。
 
 ```cpp
 // 第 1 步：算大小
@@ -151,7 +194,10 @@ if (buffer == NULL && alloc == ALLOC_CBLK) {     // STREAM + 普通混音
 }
 
 // 第 2 步：从 Client 的内存分配器分配（按进程管理）
-mCblkMemory = client->allocator().allocate(roundup(size), ...);
+// Android 15 的分配请求带名字，dumpsys meminfo / libmeminfo 里能认出是谁
+mCblkMemory = client->allocator().allocate(
+        mediautils::NamedAllocRequest{{size},
+                std::string("Track ID: ").append(std::to_string(mId))});
 mCblk = static_cast<audio_track_cblk_t*>(mCblkMemory->unsecurePointer());
 
 // 第 3 步：数据区紧跟控制块
@@ -193,17 +239,44 @@ case ALLOC_CBLK:
 
 ### 3.1 `audio_track_cblk_t`：跨进程的「控制面板」
 
-定义在 `frameworks/av/media/libaudioclient/include/media/AudioTrackShared.h`（约 207 行）。
+定义在 `frameworks/av/include/private/media/AudioTrackShared.h`（`private/media/`，不是 `libaudioclient/include/media/`，找文件时容易走错）。
 
-| 字段 | 作用 |
-|-----|------|
-| `mServer` / `mFront` / `mRear` | 服务端位置、客户端写指针、客户端提交指针（单位：帧，会环绕） |
-| `mFutex` | 等待/唤醒原语（普通播放用，非 fast 模式） |
-| `mFrameCount` | 环形缓冲区总容量（帧） |
-| `mSampleRate` / `mFrameSize` | 采样率、每帧字节数 |
-| `mVolumeLR` | 打包的左右声道音量（Q4.28 定点） |
-| `mMinimum` | 混音前最低需要的帧数 |
-| `mFlags` | `CBLK_UNDERRUN` / `CBLK_FORCEREADY` / `CBLK_INVALID` / `CBLK_DISABLED` / `CBLK_STREAM_END_DONE` |
+| 字段 | 类型 | 作用 |
+|-----|------|------|
+| `mServer` | `uint32_t` | 服务端已消费的帧数。异步更新，源码注释直言「**for entertainment purposes only**」——不能拿它做重要决策 |
+| `mFutex` | `volatile int32_t` | 等待/唤醒事件标志；`CBLK_FUTEX_WAKE` 位表示有延迟唤醒待处理 |
+| `mMinimum` | `uint32_t` | 服务端唤醒客户端的门限（可用帧数 ≥ `mMinimum` 就通知） |
+| `mVolumeLR` | `gain_minifloat_packed_t` | 打包的左右声道增益，**minifloat 格式，不是定点数** |
+| `mSampleRate` | `uint32_t` | 客户端请求的采样率，0 表示默认 |
+| `mPlaybackRateQueue` | `SingleStateQueue::Shared` | 变速播放（`AudioPlaybackRate`）的异步通道 |
+| `mSendLevel` | `uint16_t` | 发送电平（U4.12 定点，仅 remote submix 等少数场景） |
+| `mExtendedTimestampQueue` | `SingleStateQueue::Shared` | 服务端 → 客户端的时间戳队列，`getTimestamp()` 的数据源 |
+| `mBufferSizeInFrames` | `volatile uint32_t` | **有效**缓冲大小，可被 `setBufferSizeInFrames()` 缩小 |
+| `mStartThresholdInFrames` | `volatile uint32_t` | 起播门限：缓冲里至少多少帧才开始流（见 4.1） |
+| `mFlags` | `volatile int32_t` | `CBLK_*` 组合 |
+| `mState` | `std::atomic<int32_t>` | `TrackBase` 状态的镜像，源码用 `static_assert` 保证与 `IDLE / ACTIVE / PAUSING` 三个值一致 |
+| `u` | `union { mStreaming, mStatic, mAlign[8] }` | 流式/静态模式的专属区，**`mFront` / `mRear` 读写指针就在 `u.mStreaming` 里** |
+
+**三个最常被写错的点**（很多二手资料在这儿失真）：
+
+1. `mFront` / `mRear` **不是 `audio_track_cblk_t` 的顶层成员**，在 `u.mStreaming` 联合体里。
+2. `mFrameCount` / `mFrameSize` **不在控制块里**，是 `Proxy` 与 `TrackBase` 的成员。控制块里管容量的是 `mBufferSizeInFrames`。
+3. 进度用 `mServer` 表示，但它是「仅供参考」的——精确位置要走时间戳队列。
+
+`mFlags` 的位定义（源码 `CBLK_*`，排障时会直接看到这些名字）：
+
+| 标志 | 值 | 含义 |
+|-----|:--:|------|
+| `CBLK_UNDERRUN` | `0x01` | 服务端一发生欠载就置位，客户端清除 |
+| `CBLK_FORCEREADY` | `0x02` | 置位＝立即认为 Track 就绪（不等缓冲填满）；清零＝填满才就绪 |
+| `CBLK_INVALID` | `0x04` | 缓冲被 AudioFlinger 判定无效，**需要重建 Track** |
+| `CBLK_DISABLED` | `0x08` | 连续大量欠载后被禁用，需要 restart（不是立刻置位） |
+| `CBLK_LOOP_CYCLE` | `0x20` | 静态 Track 每完成一个非最后一次循环 |
+| `CBLK_LOOP_FINAL` | `0x40` | 最后一次循环完成 |
+| `CBLK_BUFFER_END` | `0x80` | 非循环模式播到缓冲末尾 |
+| `CBLK_OVERRUN` | `0x100` | 录音方向的上溢 |
+| `CBLK_INTERRUPT` | `0x200` | 客户端调用 `interrupt()` |
+| `CBLK_STREAM_END_DONE` | `0x400` | 服务端渲染完成 |
 
 **为什么用原子操作 + futex 而不是 mutex**：跨进程 mutex 每次加解锁都可能进内核（robust futex），而环形缓冲天然是「单写者 + 单读者」，用原子操作更新指针就够了；只有真正需要等待时才 futex 睡下去。这是实时音频路径上「锁越少越稳」的直接体现。
 
@@ -228,8 +301,10 @@ buffer->raw = buf.mRaw;
 
 if (buf.mFrameCount == 0 && !isStopping() && !isStopped()
         && !isPaused() && !isOffloaded()) {
-    ALOGV("%s(%d): underrun, framesReady(%zu) < framesDesired(%zu)", ...);
+    ALOGV("%s(%d): underrun,  framesReady(%zu) < framesDesired(%zd), state: %d",
+          __func__, mId, buf.mFrameCount, desiredFrames, (int)mState);
     mAudioTrackServerProxy->tallyUnderrunFrames(desiredFrames);
+    // 同时打一条 ATRACE 事件：EVENT=UNDERRUN, FRAMECOUNT=desiredFrames
 } else {
     mAudioTrackServerProxy->tallyUnderrunFrames(0);   // 传 0 表示重置连续计数
 }
@@ -262,10 +337,36 @@ if (buf.mFrameCount == 0 && !isStopping() && !isStopped()
 |-----|------|
 | 延迟低，但极易 underrun（卡顿、爆音） | 稳定，但延迟不可接受、起播慢 |
 
-- 下限：`AudioTrack.getMinBufferSize()`（**这是下限，不是推荐值**）
-- 常规建议：2～4 倍 `getMinBufferSize()`
-- 低延迟场景：`PERFORMANCE_MODE_LOW_LATENCY` + 小 buffer + 前台可见（否则 FAST 标志会被清掉，见 2.3）
-- 省电场景：`PERFORMANCE_MODE_POWER_SAVING`（`DEEP_BUFFER`，>100ms）
+**服务端会二次校正你传的 frameCount**（`PlaybackThread::createTrack_l()`），这点很少有人提：
+
+```cpp
+if (sharedBuffer == 0) {                 // 流式模式
+    pthread_once(&sFastTrackMultiplierOnce, sFastTrackMultiplierInit);
+    frameCount = max(frameCount, mFrameCount * sFastTrackMultiplier);
+}
+...
+// 非 FAST：按延迟和正常混音帧数算出下限
+minFrameCount = AudioSystem::calculateMinFrameCount(latencyMs, mNormalFrameCount,
+                                                    mSampleRate, sampleRate, speed);
+if (frameCount < minFrameCount) frameCount = minFrameCount;
+```
+
+源码注释把规则说得很直白：
+
+> Buffer depth is forced to be at least 2 x the normal mixer frame count and cover audio hardware latency. This is probably too conservative, but legacy application code may depend on it. **If you change this calculation, also review the start threshold which is related.**
+
+也就是说：
+
+- **普通 Track**：缓冲下限由 HAL 上报的 latency 和 `mNormalFrameCount` 共同决定，**至少是正常混音周期帧数的 2 倍**。你传更小的值会被顶上去。
+- **FAST Track**：走 `mFrameCount * sFastTrackMultiplier`（`sFastTrackMultiplier` 由系统属性配置），路径不同。
+- 这条计算和**起播门限**是联动的（见 4.1）——调 buffer 时两者要一起看。
+
+实践建议：
+
+- 下限参考 `AudioTrack.getMinBufferSize()`（**这是下限，不是推荐值**）
+- 常规取 2～4 倍 `getMinBufferSize()`
+- 低延迟：`PERFORMANCE_MODE_LOW_LATENCY` + 小 buffer + **采样率与设备原生一致**（否则第 ③ 关直接拒绝，见 2.3）
+- 省电：`PERFORMANCE_MODE_POWER_SAVING`（`DEEP_BUFFER`，>100ms）
 
 ## 四、阶段三：`start()` —— 挂进活跃列表
 
@@ -299,38 +400,93 @@ AudioFlinger: Track::start()           [audioflinger/Tracks.cpp]
 
 ### 4.1 为什么 `play()` 之后没有立刻出声
 
-**这是本篇最值得记住的一条**：新 Track 进列表时状态是 `FS_FILLING`，MixerThread 每轮 `prepareTracks_l()` 会检查：
+**这是本篇最值得记住的一条，而且实际机制和很多文章的写法不一样。**
 
-- `fillingStatus == FS_FILLING` 且 `framesReady < startThreshold` → **继续等待，不出声**
-- `framesReady >= startThreshold` → 置 `FS_FILLED`，解除静音，**这时才开始真正出声**
+第一半在 `PlaybackThread::addTrack_l()`，进列表时按「有没有共享缓冲」决定填充状态：
 
-所以「起播延迟」= 填到阈值的时间 + 混音周期，而不是纯的硬件延迟。几个直接推论：
-
-1. **`play()` 之前必须先 `write()` 至少一个阈值量的数据**，否则 Track 要等 App 供数据，表现为「按了播放没反应」。
-2. 阈值过大 → 起播慢；阈值过小 → 一开始就 underrun，噼啪响。
-3. 短音效（`MODE_STATIC`）不受阈值影响，因为数据在 `play()` 前已经全在内存里。
-
-### 4.2 Track 内部是 9 态，不是 Java 那 4 态
-
-Java 层只暴露 `PLAYSTATE_STOPPED / PAUSED / PLAYING`，AudioFlinger 内部是 `TrackBase::track_state`：
-
-```
-IDLE → FLUSHED → ACTIVE → PAUSING → PAUSED → RESUMING → ACTIVE
-                    │
-                    └→ STOPPING_1 → STOPPING_2 → STOPPED
+```cpp
+track->fillingStatus() = track->sharedBuffer() != 0 ? FS_FILLED : FS_FILLING;
 ```
 
-| 状态 | 含义 |
-|-----|------|
-| `IDLE` | 刚创建，未启动 |
-| `FLUSHED` | 被 flush 过，位置清零，可重新起播 |
-| `ACTIVE` | 在 `mActiveTracks` 中，正在被混音 |
-| `PAUSING` / `PAUSED` | 正在停 / 已暂停（数据保留） |
-| `RESUMING` | 从暂停恢复，等待重新对齐 |
-| `STOPPING_1` / `STOPPING_2` | 两级停止：先等当前周期数据处理完，再清理 |
-| `STOPPED` | 已停止（数据可能保留，取决于 stop 类型） |
+- `MODE_STATIC`（`sharedBuffer != 0`）→ 直接 `FS_FILLED`，**立刻可播**
+- `MODE_STREAM` → `FS_FILLING`，要等填够
 
-**排查价值**：`dumpsys media.audio_flinger` 里看到 Track 停在 `PAUSING` 或 `STOPPING_1` 不走，通常是有别的线程持锁或混音周期卡住了。
+第二半在 `Track::isReady()`（注意是 `Track` 的重写，不是 `TrackBase`）：
+
+```cpp
+if (mFillingStatus != FS_FILLING || isStopped() || isPausing()) return true;
+
+size_t bufferSizeInFrames = mServerProxy->getBufferSizeInFrames();
+const size_t startThresholdInFrames = mServerProxy->getStartThresholdInFrames();
+const size_t framesToBeReady = std::clamp(
+        std::min(startThresholdInFrames, bufferSizeInFrames), size_t(1), mFrameCount);
+
+if (framesReady() >= framesToBeReady || (mCblk->mFlags & CBLK_FORCEREADY)) {
+    mFillingStatus = FS_FILLED;
+    android_atomic_and(~CBLK_FORCEREADY, &mCblk->mFlags);
+    return true;
+}
+return false;
+```
+
+关键在 `framesToBeReady` 的三层夹取：**取 `startThreshold` 和当前 `bufferSizeInFrames` 的较小值，再夹到 `[1, mFrameCount]`**。而 `startThreshold` 的来源是创建时传入的 `frameCountToBeReady`——普通播放 Track 传的是 `SIZE_MAX`，`IAfTrack::create()` 的注释写明了默认语义：
+
+> default behaviour is to start when there are as many frames ready as possible (aka. **Buffer is full**).
+
+**所以默认行为是「缓冲区填满才起播」**，不是填一点就播。这一条能解释掉很多现象：
+
+1. **起播延迟 ≈ 一个 buffer 的时长 + 混音周期**。buffer 开大，延迟必然大——不是硬件慢。
+2. **`play()` 之前必须先 `write()`**，否则 Track 永远等不到 `framesReady >= 阈值`，表现为「按了播放没反应」。
+3. 想压低起播延迟，正确做法是调小起播门限（Java 侧 `AudioTrack.Builder.setStartThresholdInFrames()`，服务端对应 `mCblk->mStartThresholdInFrames`），而不是一味缩 buffer。
+4. 短音效用 `MODE_STATIC` 完全绕过这个机制——`FS_FILLED` 且数据已在内存。
+5. 源码注释提醒 `isReady()` **不要在 fast track 上调用**，因为 `framesReady()` 可能造成优先级反转。
+
+### 4.1.1 `start()` 也可能被拒
+
+`addTrack_l()` 的返回值不是永远 OK，`INVALID_OPERATION / PERMISSION_DENIED / DEAD_OBJECT` 都会导致起播失败，且 `Track::start()` 会把状态**回滚**：
+
+```cpp
+status = playbackThread->addTrack_l(this);
+if (status == INVALID_OPERATION || status == PERMISSION_DENIED || status == DEAD_OBJECT) {
+    triggerEvents(AudioSystem::SYNC_EVENT_PRESENTATION_COMPLETE);
+    if (status == PERMISSION_DENIED || status == DEAD_OBJECT) {
+        mState = state;   // 恢复成调用前的状态
+    }
+}
+```
+
+`PERMISSION_DENIED` 常见于焦点/静音策略拦截或 AppOps 限制；`DEAD_OBJECT` 通常是 audioserver 重启过、Track 已失效。**这两种情况下 App 的 `play()` 不会抛异常**，只能靠 `getPlayState()` 或 write 返回负值发现。
+
+### 4.2 Track 内部是 10 态，不是 Java 那 3 态
+
+Java 层只暴露 `PLAYSTATE_STOPPED / PAUSED / PLAYING` 三态；AudioFlinger 的 `track_state` 有 10 个值（录音 Track 另有 `STARTING_1 / STARTING_2`，播放用不到）。
+
+```
+IDLE
+ ├─→ ACTIVE ─→ PAUSING ─→ PAUSED ─→ RESUMING ─→ ACTIVE
+ │      │
+ │      └─→ STOPPING_1 ─→ STOPPING_2 ─→ STOPPED
+ │
+ ├─→ FLUSHED          （flush 后位置清零，可重新起播）
+ └─→ TERMINATED       （终态，资源回收）
+```
+
+| 状态 | 含义 | 判定函数 |
+|-----|------|---------|
+| `IDLE` | 刚创建，未启动 | — |
+| `FLUSHED` | 被 flush 过，位置清零 | `isStopped()` **返回 true** |
+| `STOPPED` | 已停止 | `isStopped()` **返回 true** |
+| `ACTIVE` | 在 `mActiveTracks` 中，正在被混音 | — |
+| `PAUSING` / `PAUSED` | 正在停 / 已暂停（数据保留） | `isPausing()` |
+| `RESUMING` | 从暂停恢复，等待重新对齐 | — |
+| `STOPPING_1` / `STOPPING_2` | 两级停止：先等当前周期数据处理完，再清理（Fast/Offload 专用） | `isStopping()` |
+| `TERMINATED` | 终态 | `isTerminated()` |
+
+两个和排障强相关的细节：
+
+1. **`isStopped()` 把 `FLUSHED` 也算作「停止」**，`isStopping()` 只认 `STOPPING_1/2`。所以看到 FLUSHED 不要以为是异常状态。
+2. **`dumpsys` 里显示的是字母缩写**（`getTrackStateAsCodedString()`）：`I`=IDLE、`A`=ACTIVE、`p`=PAUSING、`P`=PAUSED、`r`=RESUMING、`S`=STOPPED、`F`=FLUSHED、`s1`/`s2`=STOPPING、`T`=TERMINATED。大写是稳态、小写是瞬态——**看到 `p`/`r`/`s1` 长时间不变，就是卡在迁移过程里**。
+3. 控制块 `mState` 只镜像其中三个（`IDLE=0`、`ACTIVE=6`、`PAUSING=7`），源码用 `static_assert` 锁死了对应关系。想从共享内存侧读状态，只有这三个值可信。
 
 ## 五、阶段四：MixerThread 混音
 
@@ -460,15 +616,25 @@ tinyalsa pcm_write()
 
 ### 7.1 五种 `transfer_type`
 
-| 模式 | 谁驱动 | 典型使用者 |
-|-----|-------|-----------|
-| `TRANSFER_SYNC` | App 同步 `write()` 阻塞 | **Java `MODE_STREAM`**、OpenSL ES |
-| `TRANSFER_CALLBACK` | AF 需要数据时回调客户端 | MediaPlayer / AudioSink、低延迟 Native |
-| `TRANSFER_OBTAIN` | App 手动 `obtainBuffer()` / `releaseBuffer()` | 高级用法、需要精确控制时机 |
-| `TRANSFER_SHARED` | 一次性共享整块数据 | **Java `MODE_STATIC`** |
-| `TRANSFER_SYNC_NOTIF_CALLBACK` | 同步写 + 完成通知 | 混合场景（要写要通知） |
+| 模式 | 谁驱动 | 典型使用者 | 能否拿 FAST |
+|-----|-------|-----------|:---:|
+| `TRANSFER_SYNC` | App 同步 `write()` 阻塞 | **Java `MODE_STREAM`**、OpenSL ES | 需 `threadCanCallJava` |
+| `TRANSFER_CALLBACK` | AF 需要数据时回调客户端 | MediaPlayer / AudioSink、低延迟 Native | ✅ |
+| `TRANSFER_OBTAIN` | App 手动 `obtainBuffer()` / `releaseBuffer()` | 高级用法、需要精确控制时机 | ✅ |
+| `TRANSFER_SHARED` | 一次性共享整块数据 | **Java `MODE_STATIC`** | ✅（有共享缓冲） |
+| `TRANSFER_SYNC_NOTIF_CALLBACK` | 同步写 + 完成通知 | **Java offload**、压缩流播放 | 需 `threadCanCallJava` |
+
+**Java 层的实际映射**（`android_media_AudioTrack.cpp`，这段是判断「我的 Track 到底什么模式」的唯一依据）：
+
+| Java `MODE_*` | transfer_type | sharedBuffer |
+|--------------|---------------|-------------|
+| `MODE_STREAM`（普通） | `TRANSFER_SYNC` | `0`（服务端分配） |
+| `MODE_STREAM`（offload） | `TRANSFER_SYNC_NOTIF_CALLBACK` | `0` |
+| `MODE_STATIC` | `TRANSFER_SHARED` | `allocSharedMem()` 的结果 |
 
 **关键差异**：`TRANSFER_SYNC` 里是「App 找 AF」，`TRANSFER_CALLBACK` 里是「AF 找 App」——后者不会因为 App 主线程被占用而 underrun，这也是 MediaPlayer 不用你手动喂数据的原因。
+
+注意 `MODE_STREAM` 默认是 `TRANSFER_SYNC`，而 `TRANSFER_SYNC` 想拿 FAST 通道必须满足 `mThreadCanCallJava`（JNI 里固定传 `true`，所以 Java Track 不受影响；**Native 侧自己建 AudioTrack 时如果传 false，FAST 会被静默清掉**）。
 
 ### 7.2 性能模式 → output flags
 
@@ -490,7 +656,25 @@ tinyalsa pcm_write()
 |-----|------|---------|
 | **direct / offload 资源抢占**（所有应用） | 资源达到上限时请求 direct/offload 播放，系统会**主动废弃当前已打开的其他 direct/offload AudioTrack**。被废弃的一方 `write()` 开始返回错误 | 监听 `onMarkerReached` / write 返回负值，收到 `ERROR_DEAD_OBJECT` 要**重建 Track** |
 | **音频焦点请求限制**（targetSdk 35+） | 必须是顶层应用或运行音频相关前台服务，否则 `requestAudioFocus()` 直接返回 `AUDIOFOCUS_REQUEST_FAILED` | 后台起播（如 `BOOT_COMPLETED`）必定失败，转前台服务；别再忽略返回值 |
-| **bit-perfect 进入主流程** | `createTrack` 的响应里带 `isBitPerfect`，`dumpsys` 有 `BitPerfect` 列；走该通路时**跳过任何音量缩放和格式转换** | 做 Hi-Res 输出时检查该标志；它跟 `setVolume()` 是互斥的，设了音量就不再 bit-perfect |
+| **bit-perfect 进入主流程** | `createTrack` 的响应里带 `isBitPerfect`，`dumpsys` 有 `BitPerfect` 列；走该通路时跳过音量缩放和格式转换 | 做 Hi-Res 输出时检查该标志；**该 session 上不能挂数据处理类 effect** |
+
+bit-perfect 有个硬性副作用值得单独记一笔：`createTrack_l()` 会拿 `AUDIO_OUTPUT_FLAG_BIT_PERFECT` 去过一遍 EffectChain 兼容性检查，不通过就**直接创建失败**，不是降级：
+
+```cpp
+if (isBitPerfect) {
+    audio_output_flags_t flagsToCheck = *flags & AUDIO_OUTPUT_FLAG_BIT_PERFECT;
+    chain->checkOutputFlagCompatibility(&flagsToCheck);
+    if ((flagsToCheck & AUDIO_OUTPUT_FLAG_BIT_PERFECT) == AUDIO_OUTPUT_FLAG_NONE) {
+        ALOGE("%s cannot create track as there is data-processing effect attached to "
+              "given session id(%d)", __func__, sessionId);
+        lStatus = BAD_VALUE;
+        goto Exit;    // ← Track 建不出来
+    }
+    *flags = flagsToCheck;
+}
+```
+
+所以「开了 Hi-Res 反而没声音 / createTrack 返回 -22」，先查这个 session 上是不是还挂着均衡器或音效。
 | **`Virtualizer` 弃用 → 用 `Spatializer`** | 空间音频接口换血 | 旧音效代码要迁移，`setIsContentSpatialized` 走新通路 |
 
 另外两个与播放相关的新 API：`LoudnessCodecController`（基于 CTA-2075 的响度一致性控制，切换内容不用手调音量）、`mediaProcessing` 前台服务类型（转码等场景，与 `dataSync` 共享 6h/24h 配额）。
@@ -586,7 +770,7 @@ adb logcat | grep -iE "fastAllowed|AUDIO_OUTPUT_FLAG_FAST"
 ① buffer 开太大                    → 降到 2~4 倍 minBufferSize
 ② startThreshold 太高              → 减小，或提前 write 预填
 ③ 被降级到 DEEP_BUFFER             → 查 flags 是否被清（见 2.3）
-④ 没走 Fast 通道                   → PERFORMANCE_MODE_LOW_LATENCY + 前台可见 + 格式匹配设备原生
+④ 没走 Fast 通道                   → 过 2.3 的三道关：格式线性 PCM、采样率等于设备原生、有空闲 fast 槽位
 ```
 
 **问题 4：延迟忽大忽小 / 声音断续有规律**
@@ -626,8 +810,9 @@ EOF
 | Java API | `frameworks/base/media/java/android/media/AudioTrack.java` |
 | JNI 桥接 | `frameworks/base/core/jni/android_media_AudioTrack.cpp` |
 | Native 客户端 | `frameworks/av/media/libaudioclient/AudioTrack.cpp`（`set()` / `start()` / `write()`） |
-| 共享内存与代理 | `frameworks/av/media/libaudioclient/include/media/AudioTrackShared.h` |
+| 共享内存与代理 | `frameworks/av/include/private/media/AudioTrackShared.h` |
 | Proxy 实现 | `frameworks/av/media/libaudioclient/AudioTrackShared.cpp` |
+| Track 状态机与基类 | `frameworks/av/services/audioflinger/TrackBase.h` |
 | createTrack 服务端 | `frameworks/av/services/audioflinger/AudioFlinger.cpp` |
 | Track / TrackBase | `frameworks/av/services/audioflinger/Tracks.cpp`（TrackBase 构造约 84 行） |
 | PlaybackThread | `frameworks/av/services/audioflinger/Threads.cpp`（`threadLoop_write` 约 3626 行） |
@@ -639,16 +824,17 @@ EOF
 | tinyalsa | `external/tinyalsa/pcm.c` |
 | ALSA 内核 | `sound/core/pcm_lib.c`（`__snd_pcm_lib_xfer` / `snd_pcm_period_elapsed`） |
 
-## 十二、六个常见误区
+## 十二、七个常见误区
 
 | 误区 | 事实 |
 |-----|------|
 | 「App 到喇叭全程零拷贝」 | 只有 App → AF 是零拷贝；AF → HAL 至少还有 2 次 memcpy（③④）+ 1 次 copy_from_user（⑤） |
-| 「`play()` 之后立刻出声」 | 要等 fill 到 startThreshold 才解除静音，起播延迟主要来自这里 |
-| 「`getMinBufferSize()` 是推荐 buffer」 | 它是**下限**。按它开，稍微一忙就 underrun |
+| 「`getMinBufferSize()` 是推荐 buffer」 | 它是**下限**。按它开，稍微一忙就 underrun；而且服务端还会按 `calculateMinFrameCount()` 再顶高 |
 | 「`MODE_STATIC` 是把数据预加载进 ring buffer」 | 服务端读取逻辑完全不同，不统计 underrun，支持零 CPU 循环 |
-| 「请求了 LOW_LATENCY 就一定低延迟」 | 非线性 PCM / offload / 非前台可见 / 格式不匹配设备原生，任何一种都会清掉 `FAST` 标志，且**不报错** |
-| 「Java 的 PLAYSTATE 就是 Track 状态」 | Java 只有 3 态，AudioFlinger 内部 9 态，排障要看后者 |
+| 「请求了 LOW_LATENCY 就一定低延迟」 | 要过三道关：非线性 PCM/offload 强制 `DIRECT`、采样率必须等于设备原生、fast 槽位得有剩余。任何一道不过都会清掉 `FAST`，而且**不报错** |
+| 「`play()` 之后很快就出声」 | 默认起播门限是「缓冲区填满」——创建时传 `SIZE_MAX`，被夹取成 `mFrameCount`，起播延迟 ≈ 一个 buffer 时长 |
+| 「`mFrameCount` 在控制块里」 | 控制块里管容量的是 `mBufferSizeInFrames`；`mFrameCount` / `mFrameSize` 是 `Proxy` 与 `TrackBase` 的成员 |
+| 「Java 的 PLAYSTATE 就是 Track 状态」 | Java 只有 3 态，AudioFlinger 内部 10 态（含 `TERMINATED`），排障要看后者 |
 
 ## 十三、与其他技能的关系
 
@@ -668,5 +854,30 @@ EOF
 4. **一个隐藏延迟源**：`FS_FILLING → FS_FILLED` 的 startThreshold 判定，比硬件延迟更容易被忽略。
 5. **一条真实链路**：7 块内存、6 次搬运，其中 4 次 CPU 拷贝、1 次 DMA 零 CPU。理解这条链，才知道 underrun 该往哪一层查。
 6. **Android 15 要记住的**：direct/offload 会被系统抢占失效（必须处理 `ERROR_DEAD_OBJECT` 重建）、targetSdk 35 后台不能请求焦点、bit-perfect 标志已进主流程。
+
+## 附录：核对记录
+
+本版本对以下结论做了逐条源码校验，基准是 `frameworks/av` / `frameworks/base` / `hardware/interfaces` 的 Android 15 分支，并与 Android 15 官方行为变更文档交叉比对。
+
+**已逐字核对（引用的代码、字段、枚举与源码一致）**
+
+| 结论 | 所在位置 |
+|-----|---------|
+| `set()` 的 `DIRECT/FAST` 强制改写、`createTrack_l()` 的 `fastAllowed` 三段条件 | 2.3 |
+| `size = sizeof(cblk) + bufferSize`、`mBuffer = mCblk + sizeof(cblk)`、`NamedAllocRequest` | 2.5 |
+| `getNextBuffer()` 的 underrun 判定、`tallyUnderrunFrames` | 3.3 |
+| `isReady()` 的 `framesToBeReady` 三层夹取、`addTrack_l()` 的 `FS_FILLING/FS_FILLED` 赋值、`start()` 的失败回滚 | 4.1 / 4.1.1 |
+| `minFrameCount` 计算与「2× normal frame count」注释 | 3.5 |
+| cblk 全部字段、`CBLK_*` 位定义、`track_state` 枚举与 dumpsys 字母码 | 3.1 / 4.2 |
+| `createTrack()` 的执行顺序、失败回滚 `releaseOutput` | 2.4 |
+| JNI：`MODE_STREAM → TRANSFER_SYNC`、offload → `TRANSFER_SYNC_NOTIF_CALLBACK`、`MODE_STATIC → TRANSFER_SHARED` | 2.2 / 7.1 |
+| `Builder` 默认值、`AudioAttributes` 的 `CONTENT_TYPE_UNKNOWN` 处理 | 2.1 |
+| 官方行为变更：direct/offload 失效、targetSdk 35 焦点限制、`mediaProcessing`、`Virtualizer` 弃用 | 8 |
+
+**属归纳模型或经验值，不能当源码结论用**
+
+- 「7 块内存 6 次搬运」（6.2）是对 AIDL HAL + tinyalsa 常规路径的归纳。真实拷贝次数随厂商 HAL 实现变化——走虚拟 DMA、DSP 中转或 MMAP 模式，块数就不一样。
+- 延迟档位（~5-10ms / 40-50ms / >100ms）是量级参考，不是官方保证值。
+- `outputId` 对照表来自具体机型 dump，ID 由 `openOutput_l()` 分配，每台机器都不同。
 
 *本文基于 Android 15 (API Level 35) 源码分析，不同厂商的定制 ROM 可能存在差异。*
