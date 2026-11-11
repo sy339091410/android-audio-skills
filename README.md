@@ -29,6 +29,18 @@
 - QCOM HAL 加载机制：`dlopen` → `adev_open` → `open_input_stream`
 - 电源状态影响：WAIT_FOR_VHAL 如何导致录音初始化失败
 
+### 🎧 [android-audiotrack-playback](./android-audiotrack-playback/SKILL.md)
+
+**AudioTrack 播放流程详解** —— 从 `new AudioTrack()` 到扬声器振膜
+
+- 五个阶段全链路：创建 → 分配共享内存 → 写数据 → 起播 → 混音出硬件
+- 共享内存真相：`TrackBase` 把控制块 + PCM 环形缓冲拼成同一块内存（MODE_STREAM vs MODE_STATIC 谁分配）
+- ClientProxy / ServerProxy 双代理 + futex 同步，underrun 的精确判定条件
+- 起播延迟的真凶：`FS_FILLING → FS_FILLED` 的 startThreshold 静音判定
+- 数据搬运台账：7 块内存 6 次搬运，说清「零拷贝」到底零在哪一段
+- Android 15 变更：direct/offload 被系统抢占失效、targetSdk 35 焦点限制、bit-perfect 进主流程
+- 调试速查：dumpsys 字段逐项解读 + 四类高频问题定位顺序 + Perfetto 抓周期抖动
+
 ### 🚗 [android-car-audio-focus](./android-car-audio-focus/SKILL.md)
 
 **Android 15 车载音频焦点管理** —— 多音源协调的"交通指挥系统"
@@ -69,7 +81,7 @@
 
 本仓库会持续完善，计划覆盖的方向包括：
 
-- [ ] AudioTrack 播放流程详解
+- [x] AudioTrack 播放流程详解
 - [x] AudioPolicyService 路由策略分析
 - [ ] AAudio MMAP 低延迟路径
 - [ ] 蓝牙音频（A2DP / LE Audio）调用链
@@ -89,6 +101,8 @@ your-project/
 └── .trae/
     └── skills/
         ├── android-audio-call-chain/
+        │   └── SKILL.md
+        ├── android-audiotrack-playback/
         │   └── SKILL.md
         ├── android-audioflinger-architecture/
         │   └── SKILL.md
@@ -126,7 +140,12 @@ packages/services/Car/service/src/com/android/car/power/      # CarPowerManageme
 
 # === HAL 接口与实现 ===
 hardware/interfaces/audio/               # Audio HAL 接口定义（AIDL）
+frameworks/av/media/libaudiohal/         # HAL 客户端封装（StreamHalAidl / FMQ 三队列）
 hardware/qcom/audio/hal/                 # QCOM HAL 实现
+
+# === 驱动与内核（播放链路末端）===
+external/tinyalsa/                       # tinyalsa（pcm_write → ioctl WRITEI）
+sound/core/pcm_lib.c                     # ALSA 核心（copy_from_user → dma_area）
 
 # === 策略配置文件 ===
 /vendor/etc/audio_policy_configuration.xml        # 音频拓扑配置（mixPort/devicePort/route）

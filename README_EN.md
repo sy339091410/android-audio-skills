@@ -29,6 +29,18 @@ A curated knowledge base of Android audio subsystem skills, purpose-built for AI
 - QCOM HAL loading mechanism: `dlopen` → `adev_open` → `open_input_stream`
 - Power state impact: how WAIT_FOR_VHAL causes recording initialization failures
 
+### 🎧 [android-audiotrack-playback](./android-audiotrack-playback/SKILL.md)
+
+**AudioTrack Playback Flow Deep-dive** — From `new AudioTrack()` to the speaker cone
+
+- Five-stage pipeline: create → shared memory allocation → write → start → mix & output
+- Shared memory truth: `TrackBase` concatenates control block + PCM ring buffer into one block (who allocates in MODE_STREAM vs MODE_STATIC)
+- ClientProxy / ServerProxy dual proxies + futex sync, plus the exact underrun detection predicate
+- Real cause of start latency: the `FS_FILLING → FS_FILLED` startThreshold mute gate
+- Copy ledger: 7 memory blocks, 6 transfers — what "zero-copy" really covers
+- Android 15 changes: system-invalidated direct/offload tracks, targetSdk 35 focus restriction, bit-perfect in main path
+- Debug quick reference: dumpsys field-by-field decoding, 4 common issue triage flows, Perfetto period jitter
+
 ### 🚗 [android-car-audio-focus](./android-car-audio-focus/SKILL.md)
 
 **Android 15 Car Audio Focus Management** — The "traffic controller" for multi-source audio
@@ -67,7 +79,7 @@ A curated knowledge base of Android audio subsystem skills, purpose-built for AI
 
 ## 🚧 Roadmap
 
-- [ ] AudioTrack playback flow deep-dive
+- [x] AudioTrack playback flow deep-dive
 - [x] AudioPolicyService routing strategy analysis
 - [ ] AAudio MMAP low-latency path
 - [ ] Bluetooth audio (A2DP / LE Audio) call chain
@@ -87,6 +99,8 @@ your-project/
 └── .trae/
     └── skills/
         ├── android-audio-call-chain/
+        │   └── SKILL.md
+        ├── android-audiotrack-playback/
         │   └── SKILL.md
         ├── android-audioflinger-architecture/
         │   └── SKILL.md
@@ -124,7 +138,12 @@ packages/services/Car/service/src/com/android/car/power/      # CarPowerManageme
 
 # === HAL Interfaces & Implementations ===
 hardware/interfaces/audio/               # Audio HAL interface definitions (AIDL)
+frameworks/av/media/libaudiohal/         # HAL client wrappers (StreamHalAidl / 3 FMQs)
 hardware/qcom/audio/hal/                 # QCOM HAL implementation
+
+# === Driver & Kernel (tail of the playback chain) ===
+external/tinyalsa/                       # tinyalsa (pcm_write → ioctl WRITEI)
+sound/core/pcm_lib.c                     # ALSA core (copy_from_user → dma_area)
 
 # === Policy Configuration Files ===
 /vendor/etc/audio_policy_configuration.xml        # Audio topology config (mixPort/devicePort/route)
